@@ -690,9 +690,7 @@ def _get_managed_fixture_loop_scope(
 ) -> _ScopeName | None:
     """Return the widest loop scope of managed fixtures used by a sync test."""
     asyncio_mode = _get_asyncio_mode(metafunc.config)
-    default_loop_scope = metafunc.config.getini(
-        "asyncio_default_fixture_loop_scope"
-    )
+    default_loop_scope = metafunc.config.getini("asyncio_default_fixture_loop_scope")
     fixtureinfo = metafunc.definition._fixtureinfo
     unresolved_initialnames = {
         fixture_name
