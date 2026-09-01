@@ -38,4 +38,10 @@ A managed fixture requested only dynamically through
 ``request.getfixturevalue()`` is not known during collection and does not
 trigger loop factory parametrization for a synchronous test.
 
+pytest-asyncio relies on the static fixture closure supplied by pytest and does
+not perform additional fixture traversal. Dependencies introduced only by a
+dynamic ``pytest_generate_tests`` rewrite, or hidden behind an overridden
+same-name fixture definition that pytest does not include in that closure, do
+not trigger parametrization.
+
 To run a test with only some configured factories, see :doc:`run_test_with_specific_loop_factories`.

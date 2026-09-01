@@ -691,47 +691,15 @@ def _get_managed_fixture_loop_scope(
     """Return the widest loop scope of managed fixtures used by a sync test."""
     asyncio_mode = _get_asyncio_mode(metafunc.config)
     default_loop_scope = metafunc.config.getini("asyncio_default_fixture_loop_scope")
-    fixtureinfo = metafunc.definition._fixtureinfo
-    unresolved_initialnames = {
-        fixture_name
-        for fixture_name in fixtureinfo.initialnames
-        if fixture_name not in metafunc._arg2fixturedefs
-    }
-    discovered_fixturedefs: dict[str, Sequence[FixtureDef] | None] = {}
-
-    def get_fixturedefs(fixture_name: str) -> Sequence[FixtureDef] | None:
-        fixturedefs = metafunc._arg2fixturedefs.get(fixture_name)
-        if fixturedefs is not None:
-            return fixturedefs
-        # Directly parametrized test arguments have no static FixtureDef and must
-        # not fall back to a fixture with the same name.
-        if fixture_name in unresolved_initialnames:
-            return None
-        if fixture_name not in discovered_fixturedefs:
-            # pytest 8.4 does not add dependencies of overridden super fixtures
-            # to names_closure, so resolve those dependencies on demand.
-            discovered_fixturedefs[fixture_name] = (
-                metafunc.definition.session._fixturemanager.getfixturedefs(
-                    fixture_name, metafunc.definition
-                )
-            )
-        return discovered_fixturedefs[fixture_name]
-
     loop_scopes: list[Scope] = []
-    current_fixturedef_indices: dict[str, int] = {}
-
-    def collect_loop_scopes(fixture_name: str) -> None:
-        fixturedef_index = current_fixturedef_indices.get(fixture_name)
-        if fixturedef_index == -1:
-            return
-        fixturedefs = get_fixturedefs(fixture_name)
+    # Let pytest own fixture traversal and shadowing. There is no public API for
+    # retrieving the active FixtureDef from Metafunc, so this is intentionally a
+    # shallow, read-only use of pytest's already-computed fixture closure.
+    for fixture_name in metafunc.fixturenames:
+        fixturedefs = metafunc._arg2fixturedefs.get(fixture_name)
         if not fixturedefs:
-            return
-        if fixturedef_index is None:
-            fixturedef_index = -1
-        if -fixturedef_index > len(fixturedefs):
-            return
-        fixturedef = fixturedefs[fixturedef_index]
+            continue
+        fixturedef = fixturedefs[-1]
         func = fixturedef.func
         is_managed = _is_asyncio_fixture_function(func) or (
             asyncio_mode == Mode.AUTO and _is_coroutine_or_asyncgen(func)
@@ -743,17 +711,6 @@ def _get_managed_fixture_loop_scope(
                 or fixturedef.scope
             )
             loop_scopes.append(Scope(loop_scope))
-
-        # A fixture can request an overridden fixture with the same name. Track
-        # the active definition index so that such a request visits the next
-        # definition in the override chain, matching pytest's runtime lookup.
-        current_fixturedef_indices[fixture_name] = fixturedef_index - 1
-        for dependency_name in fixturedef.argnames:
-            collect_loop_scopes(dependency_name)
-        current_fixturedef_indices[fixture_name] = fixturedef_index
-
-    for fixture_name in fixtureinfo.initialnames:
-        collect_loop_scopes(fixture_name)
     if not loop_scopes:
         return None
     # Scope is ordered from function (narrowest) to session (widest).
@@ -795,34 +752,62 @@ def pytest_pycollect_makeitem_convert_async_functions_to_subclass(
                 and _resolve_asyncio_marker(node) is not None
             ):
                 updated_item = specialized_item_class._from_function(node)
+            elif (
+                hasattr(node, "callspec")
+                and _asyncio_loop_factory.__name__ in node.callspec.params
+            ):
+                # pytest prunes the dynamically parametrized fixture name from
+                # the static closure before creating the Function item. Put it
+                # first so its cache key changes before managed fixtures are read.
+                node.fixturenames.insert(0, _asyncio_loop_factory.__name__)
         updated_node_collection.append(updated_item)
     hook_result.force_result(updated_node_collection)
 
 
-# Direct parametrization replaces same-named fixtures during this hook. Run after
-# pytest and user hooks so the resolved fixture graph reflects those replacements.
-@pytest.hookimpl(trylast=True)
+@pytest.hookimpl(tryfirst=True)
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     specialized_item_class = PytestAsyncioFunction.item_subclass_for(
         metafunc.definition
     )
-    sync_test_uses_managed_fixture = specialized_item_class is None
     if specialized_item_class is None:
-        marker_loop_scope = _get_managed_fixture_loop_scope(metafunc)
-        if marker_loop_scope is None:
-            return
-        marker_selected_factory_names = None
-    else:
-        asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
-        if asyncio_marker is None:
-            return
-        marker_loop_scope, marker_selected_factory_names = _parse_asyncio_marker(
-            asyncio_marker
-        )
+        return
+    asyncio_marker = _resolve_asyncio_marker(metafunc.definition)
+    if asyncio_marker is None:
+        return
+    marker_loop_scope, marker_selected_factory_names = _parse_asyncio_marker(
+        asyncio_marker
+    )
+    _parametrize_loop_factories(
+        metafunc, marker_loop_scope, marker_selected_factory_names
+    )
 
+
+@pytest.hookimpl(specname="pytest_generate_tests", wrapper=True, tryfirst=True)
+def pytest_generate_tests_for_sync_functions(
+    metafunc: pytest.Metafunc,
+) -> Generator[None, object, object]:
+    hook_result = yield
+    specialized_item_class = PytestAsyncioFunction.item_subclass_for(
+        metafunc.definition
+    )
+    if specialized_item_class is not None:
+        return hook_result
+    managed_fixture_loop_scope = _get_managed_fixture_loop_scope(metafunc)
+    if managed_fixture_loop_scope is None:
+        return hook_result
+    _parametrize_loop_factories(metafunc, managed_fixture_loop_scope, None)
+    return hook_result
+
+
+def _parametrize_loop_factories(
+    metafunc: pytest.Metafunc,
+    loop_scope: _ScopeName | None,
+    selected_factory_names: Sequence[str] | None,
+) -> None:
+    """Parametrize a test over the loop factories selected for its item."""
     hook_factories = _collect_hook_loop_factories(metafunc.config, metafunc.definition)
     if hook_factories is None:
-        if marker_selected_factory_names is not None:
+        if selected_factory_names is not None:
             raise pytest.UsageError(
                 "mark.asyncio 'loop_factories' requires at least one "
                 "pytest_asyncio_loop_factories hook implementation."
@@ -831,13 +816,13 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
     factory_params: Collection[object]
     factory_ids: Collection[str]
-    if marker_selected_factory_names is None:
+    if selected_factory_names is None:
         factory_params = hook_factories.values()
         factory_ids = hook_factories.keys()
     else:
         # Iterate in marker order to preserve explicit user selection
         # order.
-        factory_ids = marker_selected_factory_names
+        factory_ids = selected_factory_names
         factory_params = [
             (
                 hook_factories[name]
@@ -853,25 +838,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
                     ),
                 )
             )
-            for name in marker_selected_factory_names
+            for name in selected_factory_names
         ]
-    if sync_test_uses_managed_fixture:
-        # Resolve the parameter before any managed fixture checks its cache. This
-        # ensures a factory change tears down and rebuilds wider-scoped fixtures
-        # before their values are supplied to a synchronous test.
-        fixtureinfo = metafunc.definition._fixtureinfo
-        if _asyncio_loop_factory.__name__ not in fixtureinfo.initialnames:
-            object.__setattr__(
-                fixtureinfo,
-                "initialnames",
-                (_asyncio_loop_factory.__name__, *fixtureinfo.initialnames),
-            )
-        if _asyncio_loop_factory.__name__ not in metafunc.fixturenames:
-            metafunc.fixturenames.insert(0, _asyncio_loop_factory.__name__)
-    else:
-        metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
+    metafunc.fixturenames.append(_asyncio_loop_factory.__name__)
     default_loop_scope = _get_default_test_loop_scope(metafunc.config)
-    loop_scope = marker_loop_scope or default_loop_scope
+    effective_loop_scope = loop_scope or default_loop_scope
     # pytest.HIDDEN_PARAM was added in pytest 8.4
     hide_id = len(factory_ids) == 1 and hasattr(pytest, "HIDDEN_PARAM")
     metafunc.parametrize(
@@ -879,7 +850,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         factory_params,
         ids=(pytest.HIDDEN_PARAM,) if hide_id else factory_ids,
         indirect=True,
-        scope=loop_scope,
+        scope=effective_loop_scope,
     )
 
 
